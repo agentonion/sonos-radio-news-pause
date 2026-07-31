@@ -5,12 +5,19 @@ room_name = ""
 # How long to stay paused during the hourly news (minutes).
 pause_minutes = 6
 
-# Only pause if the current station/track looks like Radio 2.
-# Matching is case-insensitive against title, artist, and radio show metadata.
+# Text metadata fallbacks (title/artist/album/media info). Matching is case-insensitive.
 station_match = ["radio 2", "bbc radio 2", "bbc radio2"]
+
+# Prefer these URI / service ID fragments when available (TuneIn + BBC Sounds).
+station_uri_match = ["s24940", "bbc_radio_two"]
 
 # Timezone for the hourly schedule (Radio 2 news is UK local time).
 timezone = "Europe/London"
 
 # Seconds before :00 to start watching (handles small clock drift).
 lead_seconds = 5
+
+# Sonos SSDP discovery (sleepy speakers / flaky Wi‑Fi).
+discovery_timeout = 5
+discovery_retries = 3
+discovery_backoff = 1.0

@@ -35,6 +35,16 @@ class ScheduleTests(unittest.TestCase):
         self.assertEqual(seconds_until_next_hour(at(14, 59, 50), 5), 5)
         self.assertEqual(seconds_until_next_hour(at(14, 59, 58), 5), 2)
 
+    def test_lead_in_at_59_does_not_skip_hour(self) -> None:
+        """Regression for STU-107 / #9: :59 must not schedule ~3600s ahead."""
+        # Exact timestamps from the failing production log pattern.
+        self.assertEqual(seconds_until_next_hour(at(20, 59, 54), 5), 1)
+        self.assertEqual(seconds_until_next_hour(at(20, 59, 55), 5), 5)
+        self.assertLess(seconds_until_next_hour(at(20, 59, 55), 5), 60)
+        self.assertFalse(in_top_of_hour_window(at(20, 59, 55), 5))
+        self.assertEqual(seconds_until_next_hour(at(21, 0, 0), 5), 0)
+        self.assertTrue(in_top_of_hour_window(at(21, 0, 0), 5))
+
     def test_seconds_until_at_top_of_hour(self) -> None:
         self.assertEqual(seconds_until_next_hour(at(15, 0, 3), 5), 0)
         self.assertTrue(in_top_of_hour_window(at(15, 0, 3), 5))
