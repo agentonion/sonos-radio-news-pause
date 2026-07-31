@@ -1,0 +1,16 @@
+# Sonos room name as shown in the Sonos app.
+# Leave empty to auto-pick the speaker currently playing Radio 2.
+room_name = ""
+
+# How long to stay paused during the hourly news (minutes).
+pause_minutes = 6
+
+# Only pause if the current station/track looks like Radio 2.
+# Matching is case-insensitive against title, artist, and radio show metadata.
+station_match = ["radio 2", "bbc radio 2", "bbc radio2"]
+
+# Timezone for the hourly schedule (Radio 2 news is UK local time).
+timezone = "Europe/London"
+
+# Seconds before :00 to start watching (handles small clock drift).
+lead_seconds = 5
