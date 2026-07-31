@@ -16,7 +16,7 @@ from rich.table import Table
 from rich.text import Text
 
 from sonos_common import (
-    discover_speakers,
+    discover_speakers_from_config,
     find_radio_2_target,
     in_news_window,
     load_config,
@@ -25,6 +25,7 @@ from sonos_common import (
     pause_for_news,
     select_target,
     station_patterns,
+    station_uri_patterns,
 )
 
 REFRESH_SECONDS = 1.0
@@ -73,11 +74,14 @@ class NewsPauseController:
 
     def _run_pause(self, config: dict, pause_minutes: float) -> None:
         try:
-            speakers = discover_speakers()
+            speakers = discover_speakers_from_config(config)
+            patterns = station_patterns(config)
+            uri_patterns = station_uri_patterns(config)
             target = find_radio_2_target(
                 speakers,
                 config.get("room_name", ""),
-                station_patterns(config),
+                patterns,
+                uri_patterns,
             )
             if target is None:
                 self.set_status("Top of hour — Radio 2 not playing, skipped")
@@ -111,12 +115,13 @@ def build_view(controller: NewsPauseController, config: dict) -> Panel:
     tz = ZoneInfo(config.get("timezone", "Europe/London"))
     now = datetime.now(tz)
     patterns = station_patterns(config)
+    uri_patterns = station_uri_patterns(config)
     pause_minutes = float(config.get("pause_minutes", 6))
 
     try:
-        speakers = discover_speakers()
-        target = select_target(speakers, config.get("room_name", ""), patterns)
-        playing = now_playing_for(target, patterns)
+        speakers = discover_speakers_from_config(config)
+        target = select_target(speakers, config.get("room_name", ""), patterns, uri_patterns)
+        playing = now_playing_for(target, patterns, uri_patterns)
         error = None
     except Exception as exc:  # noqa: BLE001
         playing = None
