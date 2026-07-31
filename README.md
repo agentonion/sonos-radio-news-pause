@@ -60,6 +60,12 @@ Edit `config.toml`:
 | `timezone` | `Europe/London` | Schedule timezone |
 | `lead_seconds` | `5` | Start watching slightly before `:00` |
 
+## Tests
+
+```bash
+python -m unittest discover -s tests -v
+```
+
 ## Logs
 
 When installed via `launchd`, logs go to `logs/sonos-news-pause.log`.

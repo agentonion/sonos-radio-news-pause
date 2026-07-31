@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import sys
 import threading
 import time
 from datetime import datetime
@@ -23,8 +22,9 @@ from sonos_common import (
     load_config,
     next_hour_mark,
     now_playing_for,
+    pause_for_news,
     select_target,
-    transport_state,
+    station_patterns,
 )
 
 REFRESH_SECONDS = 1.0
@@ -77,22 +77,18 @@ class NewsPauseController:
             target = find_radio_2_target(
                 speakers,
                 config.get("room_name", ""),
-                config.get("station_match", ["radio 2"]),
+                station_patterns(config),
             )
             if target is None:
                 self.set_status("Top of hour — Radio 2 not playing, skipped")
                 return
 
             self.set_status(f"News pause on {target.player_name} ({pause_minutes:g} min)")
-            target.pause()
-            time.sleep(pause_minutes * 60)
-
-            state = transport_state(target)
-            if state == "PAUSED_PLAYBACK":
-                target.play()
+            outcome = pause_for_news(target, pause_minutes)
+            if outcome == "resumed":
                 self.set_status("Resumed after news")
             else:
-                self.set_status(f"Left alone after news (state: {state})")
+                self.set_status(f"Left alone after news (state: {outcome})")
         except Exception as exc:  # noqa: BLE001
             self.set_status(f"Pause failed: {exc}")
 
@@ -101,7 +97,7 @@ def format_countdown(now: datetime, tz: ZoneInfo) -> str:
     local = now.astimezone(tz)
     target = next_hour_mark(local)
     remaining = target - local
-    total = int(remaining.total_seconds())
+    total = max(int(remaining.total_seconds()), 0)
     hours, rem = divmod(total, 3600)
     minutes, seconds = divmod(rem, 60)
     if hours:
@@ -114,7 +110,7 @@ def format_countdown(now: datetime, tz: ZoneInfo) -> str:
 def build_view(controller: NewsPauseController, config: dict) -> Panel:
     tz = ZoneInfo(config.get("timezone", "Europe/London"))
     now = datetime.now(tz)
-    patterns = config.get("station_match", ["radio 2"])
+    patterns = station_patterns(config)
     pause_minutes = float(config.get("pause_minutes", 6))
 
     try:
@@ -123,7 +119,6 @@ def build_view(controller: NewsPauseController, config: dict) -> Panel:
         playing = now_playing_for(target, patterns)
         error = None
     except Exception as exc:  # noqa: BLE001
-        speakers = []
         playing = None
         error = str(exc)
 

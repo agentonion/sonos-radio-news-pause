@@ -12,9 +12,11 @@ from zoneinfo import ZoneInfo
 from sonos_common import (
     discover_speakers,
     find_radio_2_target,
+    in_top_of_hour_window,
     load_config,
+    pause_for_news,
     seconds_until_next_hour,
-    transport_state,
+    station_patterns,
 )
 
 LOG = logging.getLogger("sonos_news_pause")
@@ -24,35 +26,17 @@ def wait_until_top_of_hour(tz: ZoneInfo, lead_seconds: int) -> None:
     while True:
         now = datetime.now(tz)
         delay = seconds_until_next_hour(now, lead_seconds)
+        if delay <= 0:
+            if in_top_of_hour_window(now, lead_seconds):
+                return
+            # Outside the trigger window after a miss; recompute.
+            time.sleep(1)
+            continue
+
         LOG.info("Next check at top of hour in %.0f seconds.", delay)
         deadline = time.monotonic() + delay
         while time.monotonic() < deadline:
             time.sleep(min(30.0, max(deadline - time.monotonic(), 0)))
-
-        now = datetime.now(tz)
-        if now.minute == 0 and now.second <= max(lead_seconds, 15):
-            return
-        # Missed the window (machine slept); wait for the next hour.
-        if now.minute >= 1:
-            continue
-        time.sleep(0.5)
-
-
-def pause_for_news(target, pause_minutes: float) -> None:
-    LOG.info(
-        "Pausing %s for %.1f minutes (Radio 2 news).",
-        target.player_name,
-        pause_minutes,
-    )
-    target.pause()
-    time.sleep(pause_minutes * 60)
-
-    state = transport_state(target)
-    if state == "PAUSED_PLAYBACK":
-        LOG.info("Resuming %s after news.", target.player_name)
-        target.play()
-    else:
-        LOG.info("Not resuming %s — transport state is %s.", target.player_name, state)
 
 
 def run_once(config: dict) -> None:
@@ -60,7 +44,7 @@ def run_once(config: dict) -> None:
     target = find_radio_2_target(
         speakers,
         config.get("room_name", ""),
-        config.get("station_match", ["radio 2"]),
+        station_patterns(config),
     )
     if target is None:
         LOG.info("Radio 2 not playing — nothing to pause.")

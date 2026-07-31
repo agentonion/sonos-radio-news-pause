@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import time
 import tomllib
+from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -14,6 +16,7 @@ from soco.groups import ZoneGroup
 
 CONFIG_PATH = Path(__file__).with_name("config.toml")
 LOG = logging.getLogger("sonos_common")
+DEFAULT_STATION_MATCH = ["radio 2"]
 
 
 @dataclass(frozen=True)
@@ -40,6 +43,10 @@ def load_config() -> dict:
         return tomllib.load(f)
 
 
+def station_patterns(config: dict) -> list[str]:
+    return list(config.get("station_match", DEFAULT_STATION_MATCH))
+
+
 def discover_speakers(timeout: float = 5) -> list[SoCo]:
     speakers = list(soco.discover(timeout=timeout) or [])
     if not speakers:
@@ -59,6 +66,16 @@ def speaker_for_room(speakers: list[SoCo], room_name: str) -> SoCo:
 def coordinator(speaker: SoCo) -> SoCo:
     group: ZoneGroup | None = speaker.group
     return group.coordinator if group else speaker
+
+
+def iter_coordinators(speakers: list[SoCo]) -> Iterator[SoCo]:
+    seen: set[str] = set()
+    for speaker in speakers:
+        target = coordinator(speaker)
+        if target.uid in seen:
+            continue
+        seen.add(target.uid)
+        yield target
 
 
 def media_blob(speaker: SoCo) -> str:
@@ -130,13 +147,8 @@ def select_target(speakers: list[SoCo], room_name: str, patterns: list[str]) -> 
     if room_name.strip():
         return coordinator(speaker_for_room(speakers, room_name))
 
-    seen: set[str] = set()
     playing: list[SoCo] = []
-    for speaker in speakers:
-        target = coordinator(speaker)
-        if target.uid in seen:
-            continue
-        seen.add(target.uid)
+    for target in iter_coordinators(speakers):
         if is_playing(target) and matches_radio_2(target, patterns):
             return target
         if is_playing(target):
@@ -147,35 +159,46 @@ def select_target(speakers: list[SoCo], room_name: str, patterns: list[str]) -> 
 
 
 def find_radio_2_target(speakers: list[SoCo], room_name: str, patterns: list[str]) -> SoCo | None:
-    if room_name.strip():
-        target = coordinator(speaker_for_room(speakers, room_name))
-        if is_playing(target) and matches_radio_2(target, patterns):
-            return target
-        return None
-
-    seen: set[str] = set()
-    for speaker in speakers:
-        target = coordinator(speaker)
-        if target.uid in seen:
-            continue
-        seen.add(target.uid)
-        if is_playing(target) and matches_radio_2(target, patterns):
-            return target
+    target = select_target(speakers, room_name, patterns)
+    if is_playing(target) and matches_radio_2(target, patterns):
+        return target
     return None
+
+
+def pause_for_news(target: SoCo, pause_minutes: float) -> str:
+    """Pause target, wait, resume only if still paused. Returns outcome label."""
+    LOG.info(
+        "Pausing %s for %.1f minutes (Radio 2 news).",
+        target.player_name,
+        pause_minutes,
+    )
+    target.pause()
+    time.sleep(pause_minutes * 60)
+
+    state = transport_state(target)
+    if state == "PAUSED_PLAYBACK":
+        LOG.info("Resuming %s after news.", target.player_name)
+        target.play()
+        return "resumed"
+
+    LOG.info("Not resuming %s — transport state is %s.", target.player_name, state)
+    return state
 
 
 def next_hour_mark(now: datetime) -> datetime:
     return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
 
+def in_top_of_hour_window(now: datetime, lead_seconds: int) -> bool:
+    return now.minute == 0 and now.second <= max(lead_seconds, 15)
+
+
 def seconds_until_next_hour(now: datetime, lead_seconds: int) -> float:
     """Seconds until we should wake for the next top-of-hour bulletin."""
-    window = max(lead_seconds, 15)
-    if now.minute == 0 and now.second <= window:
+    if in_top_of_hour_window(now, lead_seconds):
         return 0.0
 
-    this_hour = now.replace(minute=0, second=0, microsecond=0)
-    upcoming = this_hour + timedelta(hours=1)
+    upcoming = next_hour_mark(now)
     check_at = upcoming - timedelta(seconds=lead_seconds)
 
     # Already inside the lead-up to :00 — wait until the mark (or run now if past it).
