@@ -3,13 +3,15 @@
 
 from __future__ import annotations
 
+import logging
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from sonos_common import (
+    AppConfig,
     PauseIntent,
     clear_pause_state,
     load_pause_state,
@@ -20,10 +22,16 @@ from sonos_common import (
 
 
 class PauseStateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        logging.disable(logging.CRITICAL)
+
+    def tearDown(self) -> None:
+        logging.disable(logging.NOTSET)
+
     def test_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "pause_state.json"
-            resume_at = datetime(2026, 7, 31, 15, 6, tzinfo=timezone.utc)
+            resume_at = datetime(2026, 7, 31, 15, 6, tzinfo=UTC)
             intent = PauseIntent(uid="RINCON_ABC", resume_at=resume_at, player_name="Kitchen")
             write_pause_state(intent, path)
             loaded = load_pause_state(path)
@@ -74,7 +82,7 @@ class PauseStateTests(unittest.TestCase):
     def test_recover_orphaned_pause_resumes_stopped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "pause_state.json"
-            resume_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+            resume_at = datetime.now(UTC) - timedelta(seconds=1)
             write_pause_state(
                 PauseIntent(uid="RINCON_ABC", resume_at=resume_at, player_name="Kitchen"),
                 path,
@@ -92,7 +100,7 @@ class PauseStateTests(unittest.TestCase):
                 patch("sonos_common.time.sleep"),
                 patch("sonos_common.discover_speakers_from_config", return_value=[speaker]),
             ):
-                outcome = recover_orphaned_pause(config={}, state_path=path)
+                outcome = recover_orphaned_pause(config=AppConfig(), state_path=path)
 
             self.assertEqual(outcome, "resumed")
             speaker.play.assert_called_once()

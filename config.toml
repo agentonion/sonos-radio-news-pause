@@ -17,6 +17,10 @@ timezone = "Europe/London"
 # Seconds before :00 to start watching (handles small clock drift).
 lead_seconds = 5
 
+# Seconds after :00 that still count as the trigger window (floor vs lead_seconds).
+# Late wakeups / clock skew often land a few seconds past the hour.
+top_of_hour_window_seconds = 15
+
 # Sonos SSDP discovery (sleepy speakers / flaky Wi‑Fi).
 discovery_timeout = 5
 discovery_retries = 3
