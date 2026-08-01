@@ -22,4 +22,5 @@ launchctl kickstart -k "gui/$(id -u)/com.user.sonos-news-pause"
 
 echo "Installed and started: com.user.sonos-news-pause"
 echo "Logs: $ROOT/logs/sonos-news-pause.log"
-echo "Stop with: launchctl bootout gui/$(id -u)/com.user.sonos-news-pause"
+echo "Stop with: ./uninstall_launchd.sh"
+echo "Or: launchctl bootout \"gui/$(id -u)/com.user.sonos-news-pause\""

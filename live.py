@@ -14,21 +14,53 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
+from soco import SoCo
 
 from sonos_common import (
+    CONFIG_PATH,
+    AppConfig,
+    Radio2Target,
+    attempt_news_pause,
     discover_speakers_from_config,
-    find_radio_2_target,
-    in_news_window,
     load_config,
     next_hour_mark,
     now_playing_for,
-    pause_for_news,
     select_target,
+    should_trigger_news_pause,
     station_patterns,
     station_uri_patterns,
 )
 
 REFRESH_SECONDS = 1.0
+SPEAKER_REDISCOVER_SECONDS = 60.0
+
+
+class LiveResources:
+    """Cache config (by mtime) and speakers so the 1 Hz UI does not SSDP every tick."""
+
+    def __init__(self) -> None:
+        self._config: AppConfig | None = None
+        self._config_mtime: float | None = None
+        self._speakers: list[SoCo] = []
+        self._speakers_at = 0.0
+
+    def get_config(self) -> AppConfig:
+        try:
+            mtime = CONFIG_PATH.stat().st_mtime
+        except OSError:
+            mtime = None
+        if self._config is None or mtime != self._config_mtime:
+            self._config = load_config()
+            self._config_mtime = mtime
+        return self._config
+
+    def get_speakers(self, config: AppConfig, *, force: bool = False) -> list[SoCo]:
+        now = time.monotonic()
+        stale = now - self._speakers_at >= SPEAKER_REDISCOVER_SECONDS
+        if force or not self._speakers or stale:
+            self._speakers = discover_speakers_from_config(config)
+            self._speakers_at = now
+        return self._speakers
 
 
 class NewsPauseController:
@@ -51,14 +83,18 @@ class NewsPauseController:
         with self.lock:
             self.status = status
 
-    def maybe_start_pause(self, config: dict, now: datetime) -> None:
-        tz = ZoneInfo(config.get("timezone", "Europe/London"))
-        local = now.astimezone(tz)
-        hour_mark = local.replace(minute=0, second=0, microsecond=0)
-        pause_minutes = float(config.get("pause_minutes", 6))
-
-        if not in_news_window(local, pause_minutes):
+    def maybe_start_pause(
+        self,
+        config: AppConfig,
+        now: datetime,
+        speakers: list[SoCo] | None = None,
+    ) -> None:
+        # Same rule as the daemon: top-of-hour window, or catch-up while news runs
+        # (covers Mac sleep that missed :00). Once per hour via _last_pause_hour.
+        if not should_trigger_news_pause(now, config):
             return
+
+        hour_mark = now.replace(minute=0, second=0, microsecond=0)
         if self._last_pause_hour == hour_mark:
             return
         if self._pause_thread and self._pause_thread.is_alive():
@@ -67,33 +103,33 @@ class NewsPauseController:
         self._last_pause_hour = hour_mark
         self._pause_thread = threading.Thread(
             target=self._run_pause,
-            args=(config, pause_minutes),
+            args=(config, speakers),
             daemon=True,
         )
         self._pause_thread.start()
 
-    def _run_pause(self, config: dict, pause_minutes: float) -> None:
+    def _run_pause(self, config: AppConfig, speakers: list[SoCo] | None) -> None:
         try:
-            speakers = discover_speakers_from_config(config)
-            patterns = station_patterns(config)
-            uri_patterns = station_uri_patterns(config)
-            target = find_radio_2_target(
-                speakers,
-                config.get("room_name", ""),
-                patterns,
-                uri_patterns,
+            def on_target(found: Radio2Target) -> None:
+                self.set_status(
+                    f"News pause on {found.speaker.player_name} "
+                    f"({config.pause_minutes:g} min)"
+                )
+
+            result = attempt_news_pause(
+                config,
+                speakers=speakers,
+                on_target=on_target,
+                now=datetime.now(),
             )
-            if target is None:
+            if result.status == "skipped":
                 self.set_status("Top of hour — Radio 2 not playing, skipped")
                 return
-
-            self.set_status(f"News pause on {target.player_name} ({pause_minutes:g} min)")
-            outcome = pause_for_news(target, pause_minutes)
-            if outcome == "resumed":
+            if result.outcome == "resumed":
                 self.set_status("Resumed after news")
             else:
-                self.set_status(f"Left alone after news (state: {outcome})")
-        except Exception as exc:  # noqa: BLE001
+                self.set_status(f"Left alone after news (state: {result.outcome})")
+        except Exception as exc:  # noqa: BLE001 — surface any failure in the UI
             self.set_status(f"Pause failed: {exc}")
 
 
@@ -111,25 +147,29 @@ def format_countdown(now: datetime, tz: ZoneInfo) -> str:
     return f"{target.strftime('%H:%M')} (in {pretty})"
 
 
-def build_view(controller: NewsPauseController, config: dict) -> Panel:
-    tz = ZoneInfo(config.get("timezone", "Europe/London"))
+def build_view(
+    controller: NewsPauseController,
+    config: AppConfig,
+    resources: LiveResources,
+) -> Panel:
+    tz = ZoneInfo(config.timezone)
     now = datetime.now(tz)
     patterns = station_patterns(config)
     uri_patterns = station_uri_patterns(config)
-    pause_minutes = float(config.get("pause_minutes", 6))
 
     try:
-        speakers = discover_speakers_from_config(config)
-        target = select_target(speakers, config.get("room_name", ""), patterns, uri_patterns)
+        speakers = resources.get_speakers(config)
+        target = select_target(speakers, config.room_name, patterns, uri_patterns)
         playing = now_playing_for(target, patterns, uri_patterns)
         error = None
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001 — show discovery/UI errors in the panel
         playing = None
+        speakers = None
         error = str(exc)
 
     if playing:
         controller.note_track(playing.label, now)
-        controller.maybe_start_pause(config, now)
+        controller.maybe_start_pause(config, now, speakers)
 
     with controller.lock:
         status = controller.status
@@ -142,7 +182,7 @@ def build_view(controller: NewsPauseController, config: dict) -> Panel:
 
     table.add_row("Time", now.strftime("%a %d %b %H:%M:%S %Z"))
     table.add_row("Next news pause", format_countdown(now, tz))
-    table.add_row("Pause length", f"{pause_minutes:g} minutes at :00")
+    table.add_row("Pause length", f"{config.pause_minutes:g} minutes at :00")
 
     if error:
         table.add_row("Status", Text(error, style="bold red"))
@@ -168,7 +208,10 @@ def build_view(controller: NewsPauseController, config: dict) -> Panel:
     else:
         table.add_row("Status", "No speakers found")
 
-    hint = Text("Live view — updates as the track changes. Press Ctrl+C to quit.", style="dim")
+    hint = Text(
+        "Live view — same :00 trigger as the daemon. Press Ctrl+C to quit.",
+        style="dim",
+    )
     body = Group(table, Text(""), Align.center(hint))
     return Panel(
         body,
@@ -181,12 +224,13 @@ def build_view(controller: NewsPauseController, config: dict) -> Panel:
 def main() -> int:
     console = Console()
     controller = NewsPauseController()
+    resources = LiveResources()
     console.print("Starting live Sonos view…")
     try:
         with Live(console=console, refresh_per_second=4, screen=False) as live:
             while True:
-                config = load_config()
-                live.update(build_view(controller, config))
+                config = resources.get_config()
+                live.update(build_view(controller, config, resources))
                 time.sleep(REFRESH_SECONDS)
     except KeyboardInterrupt:
         console.print("\nStopped.")

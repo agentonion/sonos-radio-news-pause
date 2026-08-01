@@ -8,10 +8,14 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from sonos_common import (
+    AppConfig,
     in_news_window,
     in_top_of_hour_window,
     next_hour_mark,
+    remaining_pause_minutes,
     seconds_until_next_hour,
+    should_trigger_news_pause,
+    top_of_hour_window_seconds,
 )
 
 TZ = ZoneInfo("Europe/London")
@@ -59,6 +63,34 @@ class ScheduleTests(unittest.TestCase):
         self.assertTrue(in_news_window(at(15, 0, 30), 6))
         self.assertTrue(in_news_window(at(15, 5, 59), 6))
         self.assertFalse(in_news_window(at(15, 6, 0), 6))
+
+    def test_top_of_hour_window_floor(self) -> None:
+        # lead_seconds=5 still yields a 15s trigger window by default.
+        self.assertEqual(top_of_hour_window_seconds(5), 15)
+        self.assertTrue(in_top_of_hour_window(at(15, 0, 12), 5))
+        self.assertFalse(in_top_of_hour_window(at(15, 0, 16), 5))
+        self.assertTrue(in_top_of_hour_window(at(15, 0, 20), 5, window_seconds=30))
+
+    def test_should_trigger_uses_config_window(self) -> None:
+        config = AppConfig(
+            lead_seconds=5,
+            top_of_hour_window_seconds=15,
+            pause_minutes=6,
+        )
+        self.assertTrue(should_trigger_news_pause(at(15, 0, 10), config))
+        # Past the tight :00 window but still inside the news duration.
+        self.assertTrue(should_trigger_news_pause(at(15, 0, 20), config))
+        self.assertTrue(should_trigger_news_pause(at(15, 3, 0), config))
+        self.assertFalse(should_trigger_news_pause(at(15, 6, 0), config))
+
+    def test_remaining_pause_minutes(self) -> None:
+        self.assertEqual(remaining_pause_minutes(at(15, 0, 0), 6), 6.0)
+        self.assertEqual(remaining_pause_minutes(at(15, 2, 0), 6), 4.0)
+        self.assertEqual(remaining_pause_minutes(at(15, 6, 0), 6), 0.0)
+
+    def test_seconds_until_zero_during_news_catchup(self) -> None:
+        delay = seconds_until_next_hour(at(15, 2, 0), 5, pause_minutes=6)
+        self.assertEqual(delay, 0.0)
 
 
 if __name__ == "__main__":

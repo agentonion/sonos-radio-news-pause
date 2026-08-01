@@ -4,3 +4,7 @@ __pycache__/
 *.pyc
 .DS_Store
 pause_state.json
+*.egg-info/
+.ruff_cache/
+dist/
+build/

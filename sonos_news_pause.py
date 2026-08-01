@@ -5,22 +5,23 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 import time
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from sonos_common import (
+    AppConfig,
+    attempt_news_pause,
+    current_hour_mark,
     discover_speakers_from_config,
-    find_radio_2_target,
-    in_top_of_hour_window,
     load_config,
-    log_match_miss,
     now_playing_for,
-    pause_for_news,
-    radio_2_match,
     recover_orphaned_pause,
     seconds_until_next_hour,
     select_target,
+    should_trigger_news_pause,
+    sleep_until,
     station_patterns,
     station_uri_patterns,
 )
@@ -28,74 +29,56 @@ from sonos_common import (
 LOG = logging.getLogger("sonos_news_pause")
 
 
-def wait_until_top_of_hour(tz: ZoneInfo, lead_seconds: int) -> None:
-    """Block until inside the top-of-hour window.
+def wait_until_news_pause(config: AppConfig, tz: ZoneInfo) -> None:
+    """Block until a news-pause attempt should run.
 
-    The :59 lead-in must keep waiting into :00 — never treat minute>=1 as a
-    miss (that skipped the hour and waited ~3600s; STU-107 / #9).
+    Uses short wall-clock rechecks so Mac sleep cannot push a long ``time.sleep``
+    past the top-of-hour / news window (monotonic clocks pause while asleep).
     """
     while True:
         now = datetime.now(tz)
-        delay = seconds_until_next_hour(now, lead_seconds)
-        if delay <= 0:
-            if in_top_of_hour_window(now, lead_seconds):
-                LOG.info("Top-of-hour window reached (%s).", now.strftime("%H:%M:%S %Z"))
-                return
-            # Outside the trigger window after a miss; recompute.
-            time.sleep(1)
-            continue
+        if should_trigger_news_pause(now, config):
+            LOG.info("News pause window reached (%s).", now.strftime("%H:%M:%S %Z"))
+            return
 
-        LOG.info("Next check at top of hour in %.0f seconds.", delay)
-        deadline = time.monotonic() + delay
-        while time.monotonic() < deadline:
-            time.sleep(min(30.0, max(deadline - time.monotonic(), 0)))
+        delay = seconds_until_next_hour(
+            now,
+            config.lead_seconds,
+            config.top_of_hour_window_seconds,
+            pause_minutes=config.pause_minutes,
+        )
+        chunk = min(max(delay, 0.0), 30.0) or 1.0
+        LOG.info("Next news pause check in %.0f seconds.", delay)
+        time.sleep(chunk)
 
 
-def run_once(config: dict) -> None:
+def run_once(config: AppConfig, *, now: datetime | None = None) -> None:
     LOG.info("Running hourly Radio 2 pause check.")
-    speakers = discover_speakers_from_config(config)
-    patterns = station_patterns(config)
-    uri_patterns = station_uri_patterns(config)
-    target = find_radio_2_target(
-        speakers,
-        config.get("room_name", ""),
-        patterns,
-        uri_patterns,
-    )
-    if target is None:
-        LOG.info("Radio 2 not playing — nothing to pause.")
-        log_match_miss(speakers, config.get("room_name", ""), patterns, uri_patterns)
-        return
-    match = radio_2_match(target, patterns, uri_patterns)
-    LOG.info("Matched Radio 2 via %s on %s.", match.evidence or "unknown", target.player_name)
-    pause_for_news(target, float(config.get("pause_minutes", 6)))
+    attempt_news_pause(config, now=now)
 
 
-def run_dry_run(config: dict) -> int:
+def run_dry_run(config: AppConfig) -> int:
     """Print which room/group would be paused without changing transport state."""
     speakers = discover_speakers_from_config(config)
     patterns = station_patterns(config)
     uri_patterns = station_uri_patterns(config)
-    room_name = config.get("room_name", "")
 
-    target = select_target(speakers, room_name, patterns, uri_patterns)
+    target = select_target(speakers, config.room_name, patterns, uri_patterns)
     playing = now_playing_for(target, patterns, uri_patterns)
-    match = radio_2_match(target, patterns, uri_patterns)
 
     print(f"room:    {playing.room}")
     print(f"group:   {playing.group}")
     print(f"state:   {playing.state}")
     print(f"now:     {playing.label}")
     print(f"uri:     {playing.uri or '(none)'}")
-    print(f"match:   {match.evidence or '(no match)'}")
+    print(f"match:   {playing.match_evidence or '(no match)'}")
 
-    if not (playing.state == "PLAYING" and match.matched):
+    if not (playing.state == "PLAYING" and playing.is_radio_2):
         print("would_pause: no")
-        LOG.debug("Dry-run media blob: %s", match.blob)
         return 1
 
     print("would_pause: yes")
-    print(f"evidence: {match.evidence}")
+    print(f"evidence: {playing.match_evidence}")
     return 0
 
 
@@ -108,20 +91,31 @@ def run_daemon() -> None:
     except Exception:
         LOG.exception("Startup pause recovery failed.")
 
+    last_attempt_hour: datetime | None = None
     while True:
         config = load_config()
-        tz = ZoneInfo(config.get("timezone", "Europe/London"))
-        lead = int(config.get("lead_seconds", 5))
-        wait_until_top_of_hour(tz, lead)
+        tz = ZoneInfo(config.timezone)
+        wait_until_news_pause(config, tz)
+        now = datetime.now(tz)
+        hour_mark = current_hour_mark(now)
+        if last_attempt_hour == hour_mark:
+            # Already tried this hour; wait out the rest of the news window.
+            window_end = hour_mark + timedelta(minutes=config.pause_minutes)
+            LOG.info(
+                "Already attempted pause for %s; waiting until news window ends.",
+                hour_mark.strftime("%H:%M"),
+            )
+            sleep_until(window_end.astimezone(UTC))
+            continue
+
+        last_attempt_hour = hour_mark
         try:
-            run_once(config)
+            run_once(config, now=now)
         except Exception:
             LOG.exception("Hourly pause failed.")
-        # Avoid double-triggering in the same minute.
-        time.sleep(70)
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument(
@@ -137,18 +131,29 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument(
         "--daemon",
         action="store_true",
-        help="Run continuously (default). Used by launchd.",
+        help="Run continuously (same as default; kept for launchd ProgramArguments).",
     )
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
-def main() -> int:
-    args = parse_args()
+def _configure_logging() -> None:
+    # launchd redirects stdio to a file; force line buffering so logs appear promptly.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except Exception:
+            pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
     )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    _configure_logging()
 
     if args.dry_run:
         return run_dry_run(load_config())

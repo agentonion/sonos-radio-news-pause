@@ -6,13 +6,15 @@ import json
 import logging
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any, Literal
 
 import soco
 from soco import SoCo
+from soco.exceptions import SoCoException
 from soco.groups import ZoneGroup
 
 CONFIG_PATH = Path(__file__).with_name("config.toml")
@@ -20,12 +22,52 @@ PAUSE_STATE_PATH = Path(__file__).with_name("pause_state.json")
 LOG = logging.getLogger("sonos_common")
 
 # Text metadata fallbacks (title/artist/album/media info).
-DEFAULT_STATION_MATCH = ["radio 2", "bbc radio 2", "bbc radio2"]
+DEFAULT_STATION_MATCH: tuple[str, ...] = ("radio 2", "bbc radio 2", "bbc radio2")
 
 # Prefer these URI / service ID fragments when available (TuneIn + BBC Sounds).
-DEFAULT_STATION_URI_MATCH = ["s24940", "bbc_radio_two"]
+DEFAULT_STATION_URI_MATCH: tuple[str, ...] = ("s24940", "bbc_radio_two")
+
+# Minimum seconds after :00 that still count as the trigger window.
+# Clocks / sleep wakeups can land a few seconds late; lead_seconds alone is often too tight.
+DEFAULT_TOP_OF_HOUR_WINDOW_SECONDS = 15
 
 RESUMABLE_STATES = frozenset({"PAUSED_PLAYBACK", "STOPPED"})
+
+# SoCo UPnP calls commonly surface these; keep broader OSError for network flakes.
+SONOS_ERRORS = (OSError, TimeoutError, SoCoException)
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    room_name: str = ""
+    pause_minutes: float = 6.0
+    station_match: tuple[str, ...] = DEFAULT_STATION_MATCH
+    station_uri_match: tuple[str, ...] = DEFAULT_STATION_URI_MATCH
+    timezone: str = "Europe/London"
+    lead_seconds: int = 5
+    top_of_hour_window_seconds: int = DEFAULT_TOP_OF_HOUR_WINDOW_SECONDS
+    discovery_timeout: float = 5.0
+    discovery_retries: int = 3
+    discovery_backoff: float = 1.0
+
+    @classmethod
+    def from_mapping(cls, data: Mapping[str, Any]) -> AppConfig:
+        station_match = data.get("station_match", DEFAULT_STATION_MATCH)
+        station_uri_match = data.get("station_uri_match", DEFAULT_STATION_URI_MATCH)
+        return cls(
+            room_name=str(data.get("room_name", "") or ""),
+            pause_minutes=float(data.get("pause_minutes", 6)),
+            station_match=tuple(str(p) for p in station_match),
+            station_uri_match=tuple(str(p) for p in station_uri_match),
+            timezone=str(data.get("timezone", "Europe/London") or "Europe/London"),
+            lead_seconds=int(data.get("lead_seconds", 5)),
+            top_of_hour_window_seconds=int(
+                data.get("top_of_hour_window_seconds", DEFAULT_TOP_OF_HOUR_WINDOW_SECONDS)
+            ),
+            discovery_timeout=float(data.get("discovery_timeout", 5)),
+            discovery_retries=max(int(data.get("discovery_retries", 3)), 1),
+            discovery_backoff=float(data.get("discovery_backoff", 1.0)),
+        )
 
 
 @dataclass(frozen=True)
@@ -62,18 +104,18 @@ class PauseIntent:
     resume_at: datetime
     player_name: str = ""
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict[str, str]:
         return {
             "uid": self.uid,
-            "resume_at": self.resume_at.astimezone(timezone.utc).isoformat(),
+            "resume_at": self.resume_at.astimezone(UTC).isoformat(),
             "player_name": self.player_name,
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> PauseIntent:
+    def from_dict(cls, data: Mapping[str, Any]) -> PauseIntent:
         resume_at = datetime.fromisoformat(str(data["resume_at"]))
         if resume_at.tzinfo is None:
-            resume_at = resume_at.replace(tzinfo=timezone.utc)
+            resume_at = resume_at.replace(tzinfo=UTC)
         return cls(
             uid=str(data["uid"]),
             resume_at=resume_at,
@@ -81,24 +123,38 @@ class PauseIntent:
         )
 
 
-def load_config() -> dict:
-    with CONFIG_PATH.open("rb") as f:
-        return tomllib.load(f)
+@dataclass(frozen=True)
+class Radio2Target:
+    speaker: SoCo
+    match: StationMatch
 
 
-def station_patterns(config: dict) -> list[str]:
-    return list(config.get("station_match", DEFAULT_STATION_MATCH))
+@dataclass(frozen=True)
+class PauseAttemptResult:
+    """Outcome of shared top-of-hour pause orchestration."""
+
+    status: Literal["skipped", "paused"]
+    player_name: str = ""
+    evidence: str = ""
+    outcome: str = ""
+    detail: str = ""
 
 
-def station_uri_patterns(config: dict) -> list[str]:
-    return list(config.get("station_uri_match", DEFAULT_STATION_URI_MATCH))
+def load_config(path: Path = CONFIG_PATH) -> AppConfig:
+    with path.open("rb") as f:
+        return AppConfig.from_mapping(tomllib.load(f))
 
 
-def discovery_settings(config: dict) -> tuple[float, int, float]:
-    timeout = float(config.get("discovery_timeout", 5))
-    retries = max(int(config.get("discovery_retries", 3)), 1)
-    backoff = float(config.get("discovery_backoff", 1.0))
-    return timeout, retries, backoff
+def station_patterns(config: AppConfig) -> list[str]:
+    return list(config.station_match)
+
+
+def station_uri_patterns(config: AppConfig) -> list[str]:
+    return list(config.station_uri_match)
+
+
+def discovery_settings(config: AppConfig) -> tuple[float, int, float]:
+    return config.discovery_timeout, config.discovery_retries, config.discovery_backoff
 
 
 def discover_speakers(
@@ -107,14 +163,12 @@ def discover_speakers(
     backoff: float = 1.0,
 ) -> list[SoCo]:
     """Discover Sonos speakers, retrying with short backoff on empty results."""
-    last_empty = False
     for attempt in range(max(retries, 1)):
         speakers = list(soco.discover(timeout=timeout) or [])
         if speakers:
             if attempt > 0:
                 LOG.info("Discovery succeeded on attempt %d.", attempt + 1)
             return speakers
-        last_empty = True
         if attempt + 1 < retries:
             delay = backoff * (attempt + 1)
             LOG.warning(
@@ -125,12 +179,10 @@ def discover_speakers(
             )
             time.sleep(delay)
 
-    if last_empty:
-        raise RuntimeError("No Sonos speakers found on the local network.")
-    raise RuntimeError("Sonos discovery failed.")
+    raise RuntimeError("No Sonos speakers found on the local network.")
 
 
-def discover_speakers_from_config(config: dict) -> list[SoCo]:
+def discover_speakers_from_config(config: AppConfig) -> list[SoCo]:
     timeout, retries, backoff = discovery_settings(config)
     return discover_speakers(timeout=timeout, retries=retries, backoff=backoff)
 
@@ -166,39 +218,42 @@ def iter_coordinators(speakers: list[SoCo]) -> Iterator[SoCo]:
         yield target
 
 
-def media_blob(speaker: SoCo) -> str:
-    parts: list[str] = []
+def _track_blob_parts(track: Mapping[str, Any]) -> list[str]:
+    return [str(track.get(key) or "") for key in ("title", "artist", "album", "uri")]
+
+
+def fetch_media(speaker: SoCo) -> tuple[dict[str, Any], str, str]:
+    """Fetch track + media info once. Returns (track, uri, casefolded blob)."""
+    track: dict[str, Any] = {}
     try:
-        track = speaker.get_current_track_info() or {}
-        parts.extend(
-            str(track.get(key) or "")
-            for key in ("title", "artist", "album", "uri", "playlist_position")
-        )
-    except Exception as exc:  # noqa: BLE001
+        track = dict(speaker.get_current_track_info() or {})
+    except SONOS_ERRORS as exc:
         LOG.debug("track info failed on %s: %s", speaker.player_name, exc)
+
+    uri = str(track.get("uri") or "")
+    parts = _track_blob_parts(track)
 
     try:
         media = speaker.get_current_media_info() or {}
         parts.extend(str(value or "") for value in media.values())
-    except Exception as exc:  # noqa: BLE001
+    except SONOS_ERRORS as exc:
         LOG.debug("media info failed on %s: %s", speaker.player_name, exc)
 
-    return " ".join(parts).casefold()
+    return track, uri, " ".join(parts).casefold()
+
+
+def media_blob(speaker: SoCo) -> str:
+    return fetch_media(speaker)[2]
 
 
 def track_uri(speaker: SoCo) -> str:
-    try:
-        track = speaker.get_current_track_info() or {}
-        return str(track.get("uri") or "")
-    except Exception as exc:  # noqa: BLE001
-        LOG.debug("track uri failed on %s: %s", speaker.player_name, exc)
-        return ""
+    return fetch_media(speaker)[1]
 
 
 def transport_state(speaker: SoCo) -> str:
     try:
         return speaker.get_current_transport_info().get("current_transport_state", "UNKNOWN")
-    except Exception as exc:  # noqa: BLE001
+    except SONOS_ERRORS as exc:
         LOG.debug("transport info failed on %s: %s", speaker.player_name, exc)
         return "UNKNOWN"
 
@@ -230,24 +285,17 @@ def match_station(
     return StationMatch(False, "", blob_cf, uri)
 
 
-def matches_radio_2(
-    speaker: SoCo,
-    patterns: list[str],
-    uri_patterns: list[str] | None = None,
-) -> bool:
-    return radio_2_match(speaker, patterns, uri_patterns).matched
-
-
 def radio_2_match(
     speaker: SoCo,
     patterns: list[str],
     uri_patterns: list[str] | None = None,
 ) -> StationMatch:
+    _track, uri, blob = fetch_media(speaker)
     return match_station(
-        media_blob(speaker),
-        track_uri(speaker),
+        blob,
+        uri,
         patterns,
-        uri_patterns if uri_patterns is not None else DEFAULT_STATION_URI_MATCH,
+        uri_patterns if uri_patterns is not None else list(DEFAULT_STATION_URI_MATCH),
     )
 
 
@@ -264,17 +312,12 @@ def now_playing_for(
     uri_patterns: list[str] | None = None,
 ) -> NowPlaying:
     target = coordinator(speaker)
-    track: dict = {}
-    try:
-        track = target.get_current_track_info() or {}
-    except Exception as exc:  # noqa: BLE001
-        LOG.debug("track info failed on %s: %s", target.player_name, exc)
-    uri = str(track.get("uri") or "")
+    track, uri, blob = fetch_media(target)
     match = match_station(
-        media_blob(target),
+        blob,
         uri,
         patterns,
-        uri_patterns if uri_patterns is not None else DEFAULT_STATION_URI_MATCH,
+        uri_patterns if uri_patterns is not None else list(DEFAULT_STATION_URI_MATCH),
     )
     return NowPlaying(
         room=target.player_name,
@@ -302,10 +345,11 @@ def select_target(
 
     playing: list[SoCo] = []
     for target in iter_coordinators(speakers):
-        if is_playing(target) and matches_radio_2(target, patterns, uri_patterns):
+        if not is_playing(target):
+            continue
+        if radio_2_match(target, patterns, uri_patterns).matched:
             return target
-        if is_playing(target):
-            playing.append(target)
+        playing.append(target)
     if playing:
         return playing[0]
     return coordinator(speakers[0])
@@ -316,18 +360,27 @@ def find_radio_2_target(
     room_name: str,
     patterns: list[str],
     uri_patterns: list[str] | None = None,
-) -> SoCo | None:
+) -> Radio2Target | None:
+    """Return the playing Radio 2 coordinator and its match evidence, if any."""
     target = select_target(speakers, room_name, patterns, uri_patterns)
-    if is_playing(target) and matches_radio_2(target, patterns, uri_patterns):
-        return target
-    return None
+    if not is_playing(target):
+        return None
+    match = radio_2_match(target, patterns, uri_patterns)
+    if not match.matched:
+        return None
+    return Radio2Target(speaker=target, match=match)
 
 
-def log_match_miss(speakers: list[SoCo], room_name: str, patterns: list[str], uri_patterns: list[str]) -> None:
+def log_match_miss(
+    speakers: list[SoCo],
+    room_name: str,
+    patterns: list[str],
+    uri_patterns: list[str],
+) -> None:
     """Debug-log media blobs when Radio 2 is not detected at the top of the hour."""
     try:
         target = select_target(speakers, room_name, patterns, uri_patterns)
-    except Exception as exc:  # noqa: BLE001
+    except (RuntimeError, OSError, TimeoutError, SoCoException) as exc:
         LOG.debug("Could not select target for match miss logging: %s", exc)
         return
     match = radio_2_match(target, patterns, uri_patterns)
@@ -377,7 +430,7 @@ def resume_if_owned(target: SoCo) -> str:
     LOG.info("Resuming %s after news (was %s).", target.player_name, state)
     try:
         target.play()
-    except Exception:
+    except SONOS_ERRORS:
         LOG.exception("Resume play() failed on %s.", target.player_name)
         return "resume_failed"
 
@@ -393,15 +446,26 @@ def resume_if_owned(target: SoCo) -> str:
     )
     try:
         target.play()
-    except Exception:
+    except SONOS_ERRORS:
         LOG.exception("Resume retry failed on %s.", target.player_name)
         return "resume_failed"
     return "resumed"
 
 
+def sleep_until(deadline: datetime, *, max_chunk: float = 30.0) -> None:
+    """Sleep until a wall-clock deadline, rechecking so Mac sleep cannot overrun."""
+    if deadline.tzinfo is None:
+        deadline = deadline.replace(tzinfo=UTC)
+    while True:
+        remaining = (deadline - datetime.now(UTC)).total_seconds()
+        if remaining <= 0:
+            return
+        time.sleep(min(remaining, max_chunk))
+
+
 def pause_for_news(target: SoCo, pause_minutes: float) -> str:
     """Pause target, persist intent, wait, resume if still paused/stopped."""
-    resume_at = datetime.now(timezone.utc) + timedelta(minutes=pause_minutes)
+    resume_at = datetime.now(UTC) + timedelta(minutes=pause_minutes)
     intent = PauseIntent(uid=target.uid, resume_at=resume_at, player_name=target.player_name)
     write_pause_state(intent)
 
@@ -412,21 +476,64 @@ def pause_for_news(target: SoCo, pause_minutes: float) -> str:
     )
     try:
         target.pause()
-        time.sleep(pause_minutes * 60)
+        sleep_until(resume_at)
         outcome = resume_if_owned(target)
         LOG.info("Hourly pause outcome on %s: %s", target.player_name, outcome)
         return outcome
-    except Exception:
+    except SONOS_ERRORS:
         LOG.exception("Pause/resume failed on %s.", target.player_name)
         raise
     finally:
         clear_pause_state()
 
 
+def attempt_news_pause(
+    config: AppConfig,
+    *,
+    speakers: list[SoCo] | None = None,
+    on_target: Callable[[Radio2Target], None] | None = None,
+    now: datetime | None = None,
+) -> PauseAttemptResult:
+    """Shared daemon/live orchestration: discover → match → pause_for_news."""
+    discovered = speakers if speakers is not None else discover_speakers_from_config(config)
+    patterns = station_patterns(config)
+    uri_patterns = station_uri_patterns(config)
+    found = find_radio_2_target(discovered, config.room_name, patterns, uri_patterns)
+    if found is None:
+        LOG.info("Radio 2 not playing — nothing to pause.")
+        log_match_miss(discovered, config.room_name, patterns, uri_patterns)
+        return PauseAttemptResult(status="skipped", detail="Radio 2 not playing")
+
+    # Scheduled callers pass ``now`` so a late wake pauses only the remaining
+    # news time. Manual ``--once`` omits ``now`` and uses the full duration.
+    if now is not None:
+        pause_minutes = remaining_pause_minutes(now, config.pause_minutes)
+        if pause_minutes <= 0:
+            LOG.info("News window already over — nothing to pause.")
+            return PauseAttemptResult(status="skipped", detail="News window over")
+    else:
+        pause_minutes = config.pause_minutes
+
+    LOG.info(
+        "Matched Radio 2 via %s on %s.",
+        found.match.evidence or "unknown",
+        found.speaker.player_name,
+    )
+    if on_target is not None:
+        on_target(found)
+    outcome = pause_for_news(found.speaker, pause_minutes)
+    return PauseAttemptResult(
+        status="paused",
+        player_name=found.speaker.player_name,
+        evidence=found.match.evidence,
+        outcome=outcome,
+    )
+
+
 def recover_orphaned_pause(
     speakers: list[SoCo] | None = None,
     *,
-    config: dict | None = None,
+    config: AppConfig | None = None,
     state_path: Path = PAUSE_STATE_PATH,
 ) -> str | None:
     """On startup, finish a pause left behind by a KeepAlive restart."""
@@ -434,7 +541,7 @@ def recover_orphaned_pause(
     if intent is None:
         return None
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     remaining = (intent.resume_at - now).total_seconds()
     LOG.info(
         "Found persisted pause for %s (uid=%s); resume_at=%s (%.0fs remaining).",
@@ -446,7 +553,7 @@ def recover_orphaned_pause(
 
     if remaining > 0:
         LOG.info("Waiting %.0fs before resume recovery.", remaining)
-        time.sleep(remaining)
+        sleep_until(intent.resume_at)
 
     try:
         if speakers is None:
@@ -468,13 +575,55 @@ def next_hour_mark(now: datetime) -> datetime:
     return now.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
 
 
-def in_top_of_hour_window(now: datetime, lead_seconds: int) -> bool:
-    return now.minute == 0 and now.second <= max(lead_seconds, 15)
+def current_hour_mark(now: datetime) -> datetime:
+    return now.replace(minute=0, second=0, microsecond=0)
 
 
-def seconds_until_next_hour(now: datetime, lead_seconds: int) -> float:
-    """Seconds until we should wake for the next top-of-hour bulletin."""
-    if in_top_of_hour_window(now, lead_seconds):
+def top_of_hour_window_seconds(lead_seconds: int, window_seconds: int | None = None) -> int:
+    floor = DEFAULT_TOP_OF_HOUR_WINDOW_SECONDS if window_seconds is None else window_seconds
+    return max(lead_seconds, floor)
+
+
+def in_top_of_hour_window(
+    now: datetime,
+    lead_seconds: int,
+    window_seconds: int | None = None,
+) -> bool:
+    limit = top_of_hour_window_seconds(lead_seconds, window_seconds)
+    return now.minute == 0 and now.second <= limit
+
+
+def news_elapsed_seconds(now: datetime) -> float:
+    """Seconds since the current hour mark (:00)."""
+    return now.minute * 60 + now.second + now.microsecond / 1_000_000
+
+
+def in_news_window(now: datetime, pause_minutes: float) -> bool:
+    """True while wall-clock is inside the pause duration after :00."""
+    return news_elapsed_seconds(now) < pause_minutes * 60
+
+
+def remaining_pause_minutes(now: datetime, pause_minutes: float) -> float:
+    """Minutes left in the news window (0 when outside it)."""
+    remaining = pause_minutes * 60 - news_elapsed_seconds(now)
+    return max(remaining, 0.0) / 60.0
+
+
+def seconds_until_next_hour(
+    now: datetime,
+    lead_seconds: int,
+    window_seconds: int | None = None,
+    *,
+    pause_minutes: float | None = None,
+) -> float:
+    """Seconds until we should wake for the next news-pause attempt.
+
+    Returns 0 inside the top-of-hour trigger window, and also during the news
+    window when ``pause_minutes`` is set (catch-up after Mac sleep / late wake).
+    """
+    if in_top_of_hour_window(now, lead_seconds, window_seconds):
+        return 0.0
+    if pause_minutes is not None and in_news_window(now, pause_minutes):
         return 0.0
 
     upcoming = next_hour_mark(now)
@@ -487,6 +636,19 @@ def seconds_until_next_hour(now: datetime, lead_seconds: int) -> float:
     return (check_at - now).total_seconds()
 
 
-def in_news_window(now: datetime, pause_minutes: float) -> bool:
-    elapsed = now.minute * 60 + now.second + now.microsecond / 1_000_000
-    return elapsed < pause_minutes * 60
+def should_trigger_news_pause(
+    now: datetime,
+    config: AppConfig,
+) -> bool:
+    """Single scheduling rule for daemon and live view.
+
+    Prefer the tight top-of-hour window; also allow catch-up anytime during the
+    configured news duration so a Mac that slept through :00 can still pause.
+    """
+    if in_top_of_hour_window(
+        now,
+        config.lead_seconds,
+        config.top_of_hour_window_seconds,
+    ):
+        return True
+    return in_news_window(now, config.pause_minutes)

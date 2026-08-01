@@ -5,10 +5,14 @@ from __future__ import annotations
 
 import unittest
 
-from sonos_common import match_station
+from sonos_common import (
+    DEFAULT_STATION_MATCH,
+    DEFAULT_STATION_URI_MATCH,
+    match_station,
+)
 
-URI_PATTERNS = ["s24940", "bbc_radio_two"]
-TEXT_PATTERNS = ["radio 2", "bbc radio 2", "bbc radio2"]
+URI_PATTERNS = list(DEFAULT_STATION_URI_MATCH)
+TEXT_PATTERNS = list(DEFAULT_STATION_MATCH)
 
 
 class StationMatchTests(unittest.TestCase):

@@ -1,0 +1,32 @@
+[project]
+name = "sonos-radio-news-pause"
+version = "0.1.0"
+description = "Pause Sonos during BBC Radio 2 hourly news, then resume."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "soco==0.31.2",
+]
+
+[project.optional-dependencies]
+live = [
+    "rich==15.0.0",
+]
+dev = [
+    "rich==15.0.0",
+    "ruff==0.12.7",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["sonos_common", "sonos_news_pause", "live", "discover"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
